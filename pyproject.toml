@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exception_demo"
+version = "0.1.0"
+description = "Uni-Lab-OS 异常捕获演示设备包：跨设备动作异常捕获、业务级兜底与工作流失败传播"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["unilabos", "pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["exception_demo*"]
+
+[tool.setuptools.data-files]
+"share/exception_demo/graph" = ["graph/*.json"]

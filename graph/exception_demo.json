@@ -1,0 +1,49 @@
+{
+    "nodes": [
+        {
+            "id": "supervisor",
+            "uuid": "7be4c1f2-9a35-4c60-8d21-000000001001",
+            "name": "异常监督器",
+            "children": [],
+            "parent": null,
+            "type": "device",
+            "class": "exception_supervisor_demo",
+            "template_name": "exception_supervisor_demo",
+            "sites_initialized": true,
+            "sites": [],
+            "pose": {
+                "position": {
+                    "x": 0,
+                    "y": 0,
+                    "z": 0
+                }
+            },
+            "config": {
+                "fault_device": "fault_injector"
+            },
+            "data": {}
+        },
+        {
+            "id": "fault_injector",
+            "uuid": "7be4c1f2-9a35-4c60-8d21-000000001002",
+            "name": "故障注入器",
+            "children": [],
+            "parent": null,
+            "type": "device",
+            "class": "fault_injector_demo",
+            "template_name": "fault_injector_demo",
+            "sites_initialized": true,
+            "sites": [],
+            "pose": {
+                "position": {
+                    "x": 300,
+                    "y": 0,
+                    "z": 0
+                }
+            },
+            "config": {},
+            "data": {}
+        }
+    ],
+    "links": []
+}
