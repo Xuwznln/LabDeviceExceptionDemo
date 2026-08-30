@@ -29,7 +29,7 @@ class GuardedResult(TypedDict):
 
 @device(
     id="fault_injector_demo",
-    displayname="故障注入器",
+    display_name="故障注入器",
     category=["virtual_device"],
     description="按参数成功/抛异常/业务级捕获的演示设备，统计动作与故障次数",
     supported_backends=["hostlink", "ros2"],

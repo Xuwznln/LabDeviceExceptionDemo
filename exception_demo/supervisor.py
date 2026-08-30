@@ -28,7 +28,7 @@ FAULT_DEVICE_ID = "fault_injector"
 
 @device(
     id="exception_supervisor_demo",
-    displayname="异常监督器",
+    display_name="异常监督器",
     category=["virtual_device"],
     description="跨设备调用故障注入器，演示远端异常捕获与业务级兜底两条路径",
     supported_backends=["hostlink", "ros2"],

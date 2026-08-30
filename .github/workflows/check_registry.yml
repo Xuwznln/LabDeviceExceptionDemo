@@ -1,4 +1,4 @@
-name: Dual Backend Smoke
+﻿name: Dual Backend Smoke
 
 on:
   push:
@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 env:
-  STABLE_CORE_REF: ba03073d398c3219a3119956042e109b40bfc602
+  STABLE_CORE_REF: 28107a2f2c8fb8734836b337cbc8e5cf372450ad
 
 jobs:
   prepare:
