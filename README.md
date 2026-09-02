@@ -1,4 +1,4 @@
-# UniLabOS Exception Handling Demo
+# Uni-Lab-OS Exception Handling Demo
 
 **English** | [中文](README_zh.md)
 
