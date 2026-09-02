@@ -51,6 +51,8 @@ class FaultInjectorDemo:
         self._attempts: int = 0
         self._failures: int = 0
         self._last_error: str = ""
+        # step_name -> 已被调用次数（run_flaky 用它决定"前 N 次失败、之后成功"）
+        self._flaky_calls: Dict[str, int] = {}
 
     @not_action
     def post_init(self, node: Any) -> None:
@@ -138,6 +140,41 @@ class FaultInjectorDemo:
         except RuntimeError as exc:
             self.logger.info(f"[FaultInjector] 业务级捕获: {exc}")
             return {"success": False, "caught": type(exc).__name__, "error": str(exc)}
+
+    @action(
+        display_name="不稳定步骤",
+        description="同一 step_name 的前 N 次调用注入故障、之后成功——供 retry 决策演示：失败 attempt 落表，新 attempt 重跑成功",
+        always_free=True,
+        feedback_interval=1.0,
+    )
+    def run_flaky(
+        self,
+        step_name: str = "flaky",
+        failures_before_success: int = 1,
+        message: str = "transient-failure",
+    ) -> Dict[str, Any]:
+        """模拟瞬时故障：按 step_name 计数，前 N 次抛 RuntimeError，之后成功。
+
+        Args:
+            step_name[步骤名]: 计数键；同一步骤被 retry 重跑时计数累加。
+            failures_before_success[失败次数]: 前多少次调用注入故障。
+            message[错误文本]: 注入故障时的错误消息。
+        """
+        self._attempts += 1
+        calls = self._flaky_calls.get(step_name, 0) + 1
+        self._flaky_calls[step_name] = calls
+        if calls <= int(failures_before_success):
+            self.logger.warning(
+                f"[FaultInjector] {step_name} 第 {calls} 次调用注入瞬时故障: {message}"
+            )
+            self._inject(step_name, f"{message} (call {calls}/{failures_before_success})")
+        self.logger.info(f"[FaultInjector] {step_name} 第 {calls} 次调用成功")
+        return {
+            "success": True,
+            "step_name": step_name,
+            "calls": calls,
+            "recovered_after_failures": calls - 1,
+        }
 
     @action(
         display_name="查询统计",

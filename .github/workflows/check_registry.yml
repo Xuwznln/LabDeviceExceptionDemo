@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 env:
-  STABLE_CORE_REF: 6a5a96f68b6840b389246a2b63ca34dd285f107a
+  STABLE_CORE_REF: d5ab8db6c97d65995ccf87640e3c810ee100df25
 
 jobs:
   prepare:

@@ -24,6 +24,10 @@ workflow node:
 - **Operator replacement**: choosing `operator_intervention` with a replacement
   result marks the failed attempt as succeeded (`suc_type=operator_intervention`)
   and the task continues;
+- **Retry as a new attempt** (`fault_injector.run_flaky`): choosing `retry` keeps
+  the failed attempt in the job table as `failed` and the scheduler appends
+  `attempt 2` for the same workflow node without interrupting the task; the
+  second call succeeds and the DAG moves on;
 - **Availability after faults**: `stats` keeps serving and reports honest counters.
 
 ## Install from GitHub
@@ -66,6 +70,12 @@ replays exactly what the web UI does through the management HTTP API:
    `operator_intervention` carrying a replacement `result` → the job is released
    as `succeeded` with `suc_type=operator_intervention` and the replacement
    value → `stats` runs and reports `attempts=5, failures=4`.
+3. **"重试恢复演示"** (expected terminal state `succeeded`, 3 job rows):
+   `run_flaky(failures_before_success=1)` fails on its first call → the decision
+   is resolved with `retry` → the attempt-1 row stays `failed` (with
+   `return_info.error_resolution.selected_action = "retry"`), the scheduler
+   inserts an attempt-2 job for the same node and dispatches it → the second
+   call succeeds (`calls=2`) → `stats` reports `attempts=7, failures=5`.
 
 ## Manual start
 
@@ -92,18 +102,20 @@ idempotently upserts them into the local Workflow Authority under stable uuids
 derived from the functions' relative paths. `run_template("exception_supervisor_demo/…")`
 resolves the single supervisor instance by class; `run("fault_injector/…")`
 addresses the fault injector by instance id. Failures of actions without an
-`error_policy` enter the unified decision chain; `retry` creates a new attempt
-on the Backend side (the local scheduler releases the failed attempt), `abort`
-releases the failure, `operator_intervention` replaces the result.
+`error_policy` enter the unified decision chain: `abort` releases the failure,
+`operator_intervention` replaces the result, and `retry` records the failed
+attempt and re-dispatches the same node as a new attempt (`GET
+/api/v1/workflow-tasks/{uuid}/jobs` lists every attempt with its `attempt`
+number and `meta_data.retry_of`).
 
 ## Layout
 
 ```text
 graph/exception_demo.json          one graph shared by both backends
 exception_demo/
-  fault_injector.py                fault-injecting target device (run_step/run_guarded/stats)
+  fault_injector.py                fault-injecting target device (run_step/run_guarded/run_flaky/stats)
   supervisor.py                    probe_remote_failure: point-to-point call that catches the remote exception
-  workflows.py                     @workflow "异常传播演示" (failed) and "人工替换恢复演示" (succeeded)
+  workflows.py                     @workflow "异常传播演示" (failed), "人工替换恢复演示" and "重试恢复演示" (succeeded)
   smoke.py                         terminating real-runtime proof driven through the management API
 tests/test_hostlink_smoke.py       HostLink integration assertions
 ```

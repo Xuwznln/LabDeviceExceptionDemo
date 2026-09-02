@@ -10,8 +10,9 @@
    ``operator_intervention``（携带替代结果）放行；
 5. ``GET  /api/v1/workflow-tasks/{uuid}`` / ``/jobs``  断言任务与每个 job 的终态。
 
-两条工作流：「异常传播演示」预期 failed（abort 放行）；「人工替换恢复演示」预期
-succeeded（operator_intervention 提供替代结果后任务继续）。
+三条工作流：「异常传播演示」预期 failed（abort 放行）；「人工替换恢复演示」预期
+succeeded（operator_intervention 提供替代结果后任务继续）；「重试恢复演示」预期
+succeeded（retry：失败 attempt 落表为 failed，同节点 attempt 2 重跑成功，任务不中断）。
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from typing import Any, Sequence
 #: 与 exception_demo/workflows.py 保持一致（smoke 独立运行，不 import 设备包）。
 FAILURE_WORKFLOW_NAME = "异常传播演示"
 RECOVERY_WORKFLOW_NAME = "人工替换恢复演示"
+RETRY_WORKFLOW_NAME = "重试恢复演示"
 
 #: 人工替换结果：网页决策时由操作者填入，替代失败 attempt 的返回值。
 OPERATOR_RESULT = {"success": True, "step_name": "flaky", "replaced_by": "operator"}
@@ -101,12 +103,42 @@ def assert_recovery_workflow(proof: dict[str, Any]) -> None:
     assert replaced["return_info"]["suc_type"] == "operator_intervention", replaced
     assert replaced["return_info"]["return_value"] == OPERATOR_RESULT, replaced
 
-    # 两条工作流共 5 次动作调用，其中 4 次注入故障（explode/guarded/final/flaky）
+    # 前两条工作流共 5 次动作调用，其中 4 次注入故障（explode/guarded/final/flaky）
     stats_value = stats["return_info"]["return_value"]
     assert stats["status"] == "succeeded"
     assert stats_value["attempts"] == 5, stats_value
     assert stats_value["failures"] == 4, stats_value
     assert "transient-failure" in stats_value["last_error"], stats_value
+
+
+def assert_retry_workflow(proof: dict[str, Any]) -> None:
+    """「重试恢复演示」：失败 attempt 保留为 failed，同节点 attempt 2 成功，任务不中断。"""
+
+    assert proof["workflow_name"] == RETRY_WORKFLOW_NAME
+    assert proof["task_status"] == "succeeded", f"预期 retry 后任务成功，实际: {proof}"
+
+    decision = proof["decision"]
+    assert decision["selected_action"] == "retry"
+    assert decision["action_name"].endswith("run_flaky")
+    assert "transient-failure" in decision["error_message"], decision
+
+    # job 列表包含同一节点的两个 attempt（历史保留）+ 统计节点
+    jobs = proof["jobs"]
+    assert len(jobs) == 3, f"应有 3 个 job（含两个 attempt）: {jobs}"
+    first, second, stats = jobs
+    assert first["attempt"] == 1 and first["status"] == "failed", first
+    assert first["return_info"]["error_resolution"]["selected_action"] == "retry", first
+    assert first["error_info"], first
+    assert second["attempt"] == 2 and second["status"] == "succeeded", second
+    assert second["workflow_node_uuid"] == first["workflow_node_uuid"]
+    assert second["return_info"]["return_value"]["calls"] == 2, second
+    assert second["return_info"]["return_value"]["recovered_after_failures"] == 1, second
+
+    # 三条工作流累计 7 次调用、5 次故障（explode/guarded/final/flaky/flaky-retry#1）
+    stats_value = stats["return_info"]["return_value"]
+    assert stats["status"] == "succeeded" and stats["attempt"] == 1
+    assert stats_value["attempts"] == 7, stats_value
+    assert stats_value["failures"] == 5, stats_value
 
 
 # ---------------------------------------------------------------------------
@@ -298,10 +330,13 @@ def run_workflow(
         "task_uuid": task_uuid,
         "task_status": status,
         "decision": resolved,
-        # task 级 output 不进公开 HTTP 契约，节点结果一律取 job.return_info
+        # task 级 output 不进公开 HTTP 契约，节点结果一律取 job.return_info；
+        # 同一节点的多个 attempt 都在列表里（retry 历史）
         "jobs": [
             {
                 "uuid": job["uuid"],
+                "workflow_node_uuid": job.get("workflow_node_uuid", ""),
+                "attempt": int(job.get("attempt") or 1),
                 "status": job["status"],
                 "return_info": dict(job.get("return_info") or {}),
                 "error_info": list(job.get("error_info") or []),
@@ -361,11 +396,19 @@ def run_smoke(backend: str = "hostlink", timeout: float = 30.0) -> dict[str, Any
                     deadline,
                 )
                 assert_recovery_workflow(recovery)
+                retry = run_workflow(
+                    management_port,
+                    RETRY_WORKFLOW_NAME,
+                    {"action": "retry", "reason": "exception-demo smoke 重试瞬时故障"},
+                    deadline,
+                )
+                assert_retry_workflow(retry)
                 return {
                     "success": True,
                     "backend": backend,
                     "failure_workflow": failure,
                     "recovery_workflow": recovery,
+                    "retry_workflow": retry,
                 }
             except Exception:
                 sys.stderr.write(

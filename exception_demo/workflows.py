@@ -5,7 +5,7 @@ host 启动时由主仓 AST 扫描发现本模块（@workflow），import 后按
 创建任务后，失败的 attempt 进入错误决策链（``GET /api/v1/error-decisions``），
 由决策放行——「任务失败」是显式决策结果。
 
-两条工作流覆盖三种异常形态与两种决策：
+三条工作流覆盖三种异常形态与三种决策：
 
 1. 「异常传播演示」（预期终态 failed）：
    预热成功 -> 监督器点对点调用并在调用侧捕获远端异常（job 成功，异常在返回值）
@@ -14,6 +14,9 @@ host 启动时由主仓 AST 扫描发现本模块（@workflow），import 后按
 2. 「人工替换恢复演示」（预期终态 succeeded）：
    注入失败 -> 决策 ``operator_intervention`` 提供替代结果（job 以
    ``suc_type=operator_intervention`` 成功）-> 统计仍可服务 -> 任务 succeeded。
+3. 「重试恢复演示」（预期终态 succeeded）：
+   瞬时故障 -> 决策 ``retry``：失败 attempt 如实落表为 failed，调度器为同一节点追加
+   attempt 2 重新下发（任务不中断）-> 第二次调用成功 -> 统计 -> 任务 succeeded。
 """
 
 from unilabos.registry.workflows import WorkflowBuildContext, workflow
@@ -21,6 +24,7 @@ from unilabos.registry.workflows import WorkflowBuildContext, workflow
 #: smoke/测试按显示名检索上报结果，保持单一出处。
 FAILURE_WORKFLOW_NAME = "异常传播演示"
 RECOVERY_WORKFLOW_NAME = "人工替换恢复演示"
+RETRY_WORKFLOW_NAME = "重试恢复演示"
 
 
 @workflow(
@@ -68,3 +72,19 @@ def operator_recovery(ctx: WorkflowBuildContext) -> None:
         name="注入失败待人工处理",
     )
     ctx.run("fault_injector/stats", {}, name="故障后统计")
+
+
+@workflow(
+    display_name=RETRY_WORKFLOW_NAME,
+    description="瞬时故障 -> 决策链 retry 为同一节点追加新 attempt -> 重跑成功 -> 统计（预期终态 succeeded）",
+    tags=["exception-demo", "retry"],
+)
+def retry_recovery(ctx: WorkflowBuildContext) -> None:
+    """第一次调用注入故障、retry 后第二次成功；两个 attempt 都留在 job 表里。"""
+
+    ctx.run(
+        "fault_injector/run_flaky",
+        {"step_name": "flaky-retry", "failures_before_success": 1, "message": "transient-failure"},
+        name="瞬时故障后重试",
+    )
+    ctx.run("fault_injector/stats", {}, name="重试后统计")
