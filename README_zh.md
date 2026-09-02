@@ -18,8 +18,8 @@
 - **人工替换结果**：决策选 `operator_intervention` 并携带替代结果，失败 attempt 以
   `suc_type=operator_intervention` 成功放行，任务继续；
 - **重试即新 attempt**（`fault_injector.run_flaky`）：决策选 `retry`，失败 attempt 保留在
-  job 表里记为 `failed`，调度器为同一工作流节点追加 `attempt 2` 重新下发、任务不中断；
-  第二次调用成功后 DAG 继续；
+  节点运行的历史里，同一事务内为同一节点运行追加 `attempt 2`、任务不中断；第二次调用成功后
+  成为该节点的当前结果，DAG 继续；
 - **故障后可用性**：`stats` 继续服务并如实计数。
 
 ## 从 GitHub 安装
@@ -48,19 +48,24 @@ python -m exception_demo.smoke --backend ros2 --timeout 60
 smoke 启动真实运行时（`unilab -g graph/exception_demo.json`，启动时把 `@workflow` 模板上报到
 本机 Workflow Authority），然后经管理 HTTP API 完整复现网页的操作：
 
-1. **「异常传播演示」**（预期终态 `failed`，4 个 job）：`run_step(warmup)` 成功 →
-   `supervisor.probe_remote_failure` 在调用侧捕获远端 `RuntimeError`（job `succeeded`，
+节点结果一律读 `GET /api/v1/workflow-tasks/{uuid}/node-runs`：每个工作流节点一条，`status /
+return_info` 是当前 attempt 的结果，`attempts` 内嵌该节点的完整执行历史。
+
+1. **「异常传播演示」**（预期终态 `failed`，4 个节点运行）：`run_step(warmup)` 成功 →
+   `supervisor.probe_remote_failure` 在调用侧捕获远端 `RuntimeError`（节点 `succeeded`，
    返回值 `caught: true` 且错误文本保真携带 `injected-failure`）→ `run_guarded(fail=True)`
-   返回结构化错误（job `succeeded`）→ `run_step(final, fail=True)` 异常穿出；待决策报文
+   返回结构化错误（节点 `succeeded`）→ `run_step(final, fail=True)` 异常穿出；待决策报文
    （异常类型、错误文本、可选项 `retry` / `abort` / `operator_intervention`）以 `abort` 放行，
-   该 job `failed` 且带 `error_info`，任务终态 `failed`。
-2. **「人工替换恢复演示」**（预期终态 `succeeded`，2 个 job）：`run_step(flaky, fail=True)`
-   失败 → 决策选 `operator_intervention` 并携带替代 `result` → 该 job 以
+   该节点运行 `failed` 且带 `error_info`，任务终态 `failed`。
+2. **「人工替换恢复演示」**（预期终态 `succeeded`，2 个节点运行）：`run_step(flaky, fail=True)`
+   失败 → 决策选 `operator_intervention` 并携带替代 `result` → 同一 attempt 以
    `suc_type=operator_intervention` 和替代值成功放行 → `stats` 运行并报告
    `attempts=5, failures=4`。
-3. **「重试恢复演示」**（预期终态 `succeeded`，3 行 job）：`run_flaky(failures_before_success=1)`
-   第一次调用失败 → 决策选 `retry` → attempt 1 那行保留为 `failed`（`return_info.error_resolution.selected_action = "retry"`），
-   调度器为同一节点插入 attempt 2 并下发 → 第二次调用成功（`calls=2`）→ `stats` 报告
+3. **「重试恢复演示」**（预期终态 `succeeded`，2 个节点运行）：`run_flaky(failures_before_success=1)`
+   第一次调用失败 → 决策选 `retry` → 同一事务内 attempt 1 记 `failed`
+   （`error_resolution.selected_action = "retry"`）、为同一节点运行插入 attempt 2
+   （`retry_of_job_uuid`、`trigger=retry_decision`）、节点运行回到 `pending` → 第二次调用成功
+   （`calls=2`）成为该节点的当前结果（`attempt_count=2`，历史里保留 attempt 1）→ `stats` 报告
    `attempts=7, failures=5`。
 
 ## 手动启动
@@ -87,8 +92,9 @@ AST 扫描发现该模块，按函数相对路径派生稳定 uuid 幂等上报�
 `run_template("exception_supervisor_demo/…")` 按类名解析唯一的监督器实例；
 `run("fault_injector/…")` 按实例 id 指定故障注入器。未配置 `error_policy` 的动作失败进入
 统一决策链：`abort` 放行失败结果，`operator_intervention` 用人工提供的结果替换，`retry` 把失败
-attempt 记录下来并把同一节点作为新 attempt 重新下发（`GET /api/v1/workflow-tasks/{uuid}/jobs`
-列出每个 attempt，带 `attempt` 序号与 `meta_data.retry_of`）。
+attempt 记录下来并把同一节点运行作为新 attempt 重新下发。`GET /api/v1/workflow-tasks/{uuid}/node-runs`
+是节点级视图（当前结果 + `attempts` 历史）；`GET /api/v1/workflow-tasks/{uuid}/jobs` 平铺列出
+attempt，其 `job_uuid` 与错误决策报文里的 `job_id` 一致。
 
 ## 目录
 

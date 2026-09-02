@@ -25,9 +25,9 @@ workflow node:
   result marks the failed attempt as succeeded (`suc_type=operator_intervention`)
   and the task continues;
 - **Retry as a new attempt** (`fault_injector.run_flaky`): choosing `retry` keeps
-  the failed attempt in the job table as `failed` and the scheduler appends
-  `attempt 2` for the same workflow node without interrupting the task; the
-  second call succeeds and the DAG moves on;
+  the failed attempt in the node run's history and, in the same transaction,
+  appends `attempt 2` for the same node run without interrupting the task; the
+  second call succeeds, becomes the node's current result and the DAG moves on;
 - **Availability after faults**: `stats` keeps serving and reports honest counters.
 
 ## Install from GitHub
@@ -57,25 +57,31 @@ The smoke boots the real runtime (`unilab -g graph/exception_demo.json`, which
 also reports the `@workflow` templates to the local Workflow Authority) and then
 replays exactly what the web UI does through the management HTTP API:
 
-1. **"异常传播演示"** (expected terminal state `failed`, 4 jobs):
+Node results are read from `GET /api/v1/workflow-tasks/{uuid}/node-runs`: one
+entry per workflow node whose `status` / `return_info` are the current attempt's,
+with the full `attempts` history embedded.
+
+1. **"异常传播演示"** (expected terminal state `failed`, 4 node runs):
    `run_step(warmup)` succeeds → `supervisor.probe_remote_failure` catches the
-   remote `RuntimeError` on the caller side (job `succeeded`, `caught: true`
+   remote `RuntimeError` on the caller side (node `succeeded`, `caught: true`
    with the faithful `injected-failure` text) → `run_guarded(fail=True)`
-   returns a structured error (job `succeeded`) → `run_step(final, fail=True)`
+   returns a structured error (node `succeeded`) → `run_step(final, fail=True)`
    escapes; the pending decision report (exception type, error text, options
    `retry` / `abort` / `operator_intervention`) is resolved with `abort`; the
-   job ends `failed` with `error_info` and the task ends `failed`.
-2. **"人工替换恢复演示"** (expected terminal state `succeeded`, 2 jobs):
+   node run ends `failed` with `error_info` and the task ends `failed`.
+2. **"人工替换恢复演示"** (expected terminal state `succeeded`, 2 node runs):
    `run_step(flaky, fail=True)` fails → the decision is resolved with
-   `operator_intervention` carrying a replacement `result` → the job is released
-   as `succeeded` with `suc_type=operator_intervention` and the replacement
-   value → `stats` runs and reports `attempts=5, failures=4`.
-3. **"重试恢复演示"** (expected terminal state `succeeded`, 3 job rows):
+   `operator_intervention` carrying a replacement `result` → the same attempt is
+   released as `succeeded` with `suc_type=operator_intervention` and the
+   replacement value → `stats` runs and reports `attempts=5, failures=4`.
+3. **"重试恢复演示"** (expected terminal state `succeeded`, 2 node runs):
    `run_flaky(failures_before_success=1)` fails on its first call → the decision
-   is resolved with `retry` → the attempt-1 row stays `failed` (with
-   `return_info.error_resolution.selected_action = "retry"`), the scheduler
-   inserts an attempt-2 job for the same node and dispatches it → the second
-   call succeeds (`calls=2`) → `stats` reports `attempts=7, failures=5`.
+   is resolved with `retry` → in one transaction attempt 1 is recorded `failed`
+   (`error_resolution.selected_action = "retry"`), attempt 2 is inserted for the
+   same node run (`retry_of_job_uuid`, `trigger=retry_decision`) and the node run
+   goes back to `pending` → the second call succeeds (`calls=2`) and becomes the
+   node run's current result (`attempt_count=2`, history keeps attempt 1) →
+   `stats` reports `attempts=7, failures=5`.
 
 ## Manual start
 
@@ -104,9 +110,10 @@ resolves the single supervisor instance by class; `run("fault_injector/…")`
 addresses the fault injector by instance id. Failures of actions without an
 `error_policy` enter the unified decision chain: `abort` releases the failure,
 `operator_intervention` replaces the result, and `retry` records the failed
-attempt and re-dispatches the same node as a new attempt (`GET
-/api/v1/workflow-tasks/{uuid}/jobs` lists every attempt with its `attempt`
-number and `meta_data.retry_of`).
+attempt and re-dispatches the same node run as a new attempt. `GET
+/api/v1/workflow-tasks/{uuid}/node-runs` is the node-level view (current result
+plus `attempts` history); `GET /api/v1/workflow-tasks/{uuid}/jobs` lists the
+attempts flat, with `job_uuid` matching the `job_id` in error-decision reports.
 
 ## Layout
 
