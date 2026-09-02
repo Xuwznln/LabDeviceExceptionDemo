@@ -1,17 +1,17 @@
-"""有限时启动真实图，验证跨设备异常捕获，再运行预期失败的默认子工作流。
+"""网页工作流提交模式的有限时 smoke：起真实运行时，经管理 HTTP API 提交工作流并做决策。
 
-阶段一（闭环）：supervisor 依次调用 fault_injector 的成功/异常/受护/统计
-四个动作，把捕获结果写出 proof.json。
+网页（edge UI）对本机 Workflow Authority 的操作就是下面这几个 HTTP 调用，本脚本
+逐一复现，不在设备内部自跑任何闭环：
 
-阶段二（工作流）：host 启动时已把 exception_demo/workflows.py 里的 @workflow
-幂等上报到本机 Workflow Authority；本脚本通过管理 HTTP API 找到它、创建任务。
-第三步注入的异常会把 job 挂入 Backend 错误决策链（GET /error-decisions），
-脚本断言决策报文（异常类型/错误文本/可选项）后选择「标记失败」放行，
-最终断言任务终态 failed、前两步 succeeded、第三步 failed 且 error_info 非空。
+1. ``GET  /api/v1/workflows``                    找到 host 启动时上报的 @workflow 模板；
+2. ``POST /api/v1/workflow-tasks``               创建任务（网页"运行"按钮）；
+3. ``GET  /api/v1/error-decisions``              失败 attempt 的待决策报文出现；
+4. ``POST /api/v1/error-decisions/{decision_id}`` 网页选择 ``abort`` 或
+   ``operator_intervention``（携带替代结果）放行；
+5. ``GET  /api/v1/workflow-tasks/{uuid}`` / ``/jobs``  断言任务与每个 job 的终态。
 
-两条异常路径的对照是本演示的核心：
-- call_device_action 点对点调用：远端异常直接抛给调用方（阶段一）；
-- 调度 job：失败先进入错误决策链，由决策放行/重试/人工替换（阶段二）。
+两条工作流：「异常传播演示」预期 failed（abort 放行）；「人工替换恢复演示」预期
+succeeded（operator_intervention 提供替代结果后任务继续）。
 """
 
 from __future__ import annotations
@@ -31,75 +31,87 @@ import urllib.request
 from typing import Any, Sequence
 
 #: 与 exception_demo/workflows.py 保持一致（smoke 独立运行，不 import 设备包）。
-WORKFLOW_DISPLAY_NAME = "异常传播演示"
+FAILURE_WORKFLOW_NAME = "异常传播演示"
+RECOVERY_WORKFLOW_NAME = "人工替换恢复演示"
+
+#: 人工替换结果：网页决策时由操作者填入，替代失败 attempt 的返回值。
+OPERATOR_RESULT = {"success": True, "step_name": "flaky", "replaced_by": "operator"}
+
+TERMINAL = {"succeeded", "failed"}
 
 
-def assert_smoke_proof(proof: dict[str, Any], backend: str) -> None:
-    """对 HostLink/ROS2 共用的三类异常路径做同一组断言。"""
-
-    assert proof.get("success") is True, f"smoke 未成功: {proof}"
-    assert proof.get("backend") == backend, f"backend 不匹配: {proof}"
-    assert proof["fault_device"] == "fault_injector"
-
-    # 1) 正常成功路径
-    ok_step = proof["ok_step"]
-    assert ok_step["success"] is True
-    assert ok_step["step_name"] == "warmup"
-
-    # 2) 远端抛异常 -> 调用方捕获；错误文本保真携带注入的消息
-    caught = proof["caught"]
-    assert caught["caught"] is True, f"远端异常未被捕获: {caught}"
-    assert caught["error_type"], f"缺少异常类型: {caught}"
-    assert "injected-failure" in caught["error_text"], f"错误文本丢失: {caught}"
-
-    # 3) 业务级兜底 -> 动作成功返回结构化错误
-    guarded = proof["guarded"]
-    assert guarded["success"] is False
-    assert guarded["caught"] == "RuntimeError"
-    assert "guarded-failure" in guarded["error"]
-
-    # 4) 故障后设备仍在服务，计数与三次调用一致
-    stats = proof["stats"]
-    assert stats["success"] is True
-    assert stats["attempts"] == 3
-    assert stats["failures"] == 2
-    assert "injected-failure" in stats["last_error"] or "guarded-failure" in stats["last_error"]
+# ---------------------------------------------------------------------------
+# 断言
+# ---------------------------------------------------------------------------
 
 
-def assert_workflow_proof(workflow_proof: dict[str, Any]) -> None:
-    """断言默认子工作流：决策链捕获失败节点，放行后任务整体 failed。"""
+def assert_failure_workflow(proof: dict[str, Any]) -> None:
+    """「异常传播演示」：三种异常形态各在正确位置被捕获，abort 后任务 failed。"""
 
-    assert workflow_proof["workflow_name"] == WORKFLOW_DISPLAY_NAME
-    assert workflow_proof["task_status"] == "failed", (
-        f"预期任务失败传播，实际: {workflow_proof}"
-    )
+    assert proof["workflow_name"] == FAILURE_WORKFLOW_NAME
+    assert proof["task_status"] == "failed", f"预期任务失败传播，实际: {proof}"
 
-    # 失败 attempt 先进入 Backend 错误决策链，报文携带异常与可选项
-    decision = workflow_proof["decision"]
-    assert decision["resolved_action"] == "abort"
+    decision = proof["decision"]
+    assert decision["selected_action"] == "abort"
     assert decision["exception_type"] == "RuntimeError", f"决策报文异常类型: {decision}"
     assert "injected-failure" in decision["error_message"], f"决策报文错误文本: {decision}"
     assert {"retry", "abort", "operator_intervention"} <= set(decision["options"])
     assert decision["action_name"].endswith("run_step")
     assert decision["device_id"] == "fault_injector"
 
-    jobs = workflow_proof["jobs"]
-    assert len(jobs) == 3, f"应有 3 个节点 job: {jobs}"
+    jobs = proof["jobs"]
+    assert len(jobs) == 4, f"应有 4 个节点 job: {jobs}"
+    warmup, probe, guarded, final = jobs
 
-    # jobs 按 topological_index 返回；节点 uuid 序 == 声明序
-    warmup_job, guarded_job, final_job = jobs
-    assert warmup_job["status"] == "succeeded"
-    assert warmup_job["return_info"]["return_value"]["step_name"] == "warmup"
+    assert warmup["status"] == "succeeded"
+    assert warmup["return_info"]["return_value"]["step_name"] == "warmup"
 
-    # 业务级捕获：job 成功，错误在返回值里
-    assert guarded_job["status"] == "succeeded"
-    guarded_value = guarded_job["return_info"]["return_value"]
+    # 点对点：远端异常回到调用方 try/except，job 成功，异常在返回值里
+    assert probe["status"] == "succeeded"
+    probe_value = probe["return_info"]["return_value"]
+    assert probe_value["caught"] is True, probe_value
+    assert probe_value["error_type"], probe_value
+    assert "injected-failure" in probe_value["error_text"], probe_value
+
+    # 业务级兜底：驱动内部捕获，job 成功，错误在返回值里
+    assert guarded["status"] == "succeeded"
+    guarded_value = guarded["return_info"]["return_value"]
     assert guarded_value["success"] is False
     assert guarded_value["caught"] == "RuntimeError"
 
     # 异常穿出动作边界：job 失败并留下 error_info
-    assert final_job["status"] == "failed"
-    assert final_job["error_info"], f"失败 job 缺少 error_info: {final_job}"
+    assert final["status"] == "failed"
+    assert final["error_info"], f"失败 job 缺少 error_info: {final}"
+
+
+def assert_recovery_workflow(proof: dict[str, Any]) -> None:
+    """「人工替换恢复演示」：operator_intervention 替换结果后 job 成功，任务继续并成功。"""
+
+    assert proof["workflow_name"] == RECOVERY_WORKFLOW_NAME
+    assert proof["task_status"] == "succeeded", f"预期任务成功，实际: {proof}"
+
+    decision = proof["decision"]
+    assert decision["selected_action"] == "operator_intervention"
+    assert "transient-failure" in decision["error_message"], decision
+
+    jobs = proof["jobs"]
+    assert len(jobs) == 2, f"应有 2 个节点 job: {jobs}"
+    replaced, stats = jobs
+    assert replaced["status"] == "succeeded"
+    assert replaced["return_info"]["suc_type"] == "operator_intervention", replaced
+    assert replaced["return_info"]["return_value"] == OPERATOR_RESULT, replaced
+
+    # 两条工作流共 5 次动作调用，其中 4 次注入故障（explode/guarded/final/flaky）
+    stats_value = stats["return_info"]["return_value"]
+    assert stats["status"] == "succeeded"
+    assert stats_value["attempts"] == 5, stats_value
+    assert stats_value["failures"] == 4, stats_value
+    assert "transient-failure" in stats_value["last_error"], stats_value
+
+
+# ---------------------------------------------------------------------------
+# 进程与 HTTP
+# ---------------------------------------------------------------------------
 
 
 def _free_port() -> int:
@@ -179,11 +191,6 @@ def _base_command(
     return command
 
 
-# ---------------------------------------------------------------------------
-# 管理 HTTP API（工作流阶段）
-# ---------------------------------------------------------------------------
-
-
 def _api_request(
     port: int, path: str, payload: dict[str, Any] | None = None
 ) -> Any:
@@ -208,27 +215,44 @@ def _api_request(
     return body
 
 
-def _resolve_failure_decision(
-    management_port: int, task_uuid: str, deadline: float
+def _wait_management_api(port: int, process: subprocess.Popen[Any], deadline: float) -> None:
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("runtime process exited before the management API came up")
+        try:
+            if _api_request(port, "/health").get("status") == "ok":
+                return
+        except (urllib.error.URLError, OSError):
+            pass
+        time.sleep(0.3)
+    raise RuntimeError("管理 API 未在时限内就绪")
+
+
+def _find_workflow(port: int, name: str, deadline: float) -> dict[str, Any]:
+    while time.monotonic() < deadline:
+        listing = _api_request(port, "/workflows?page=1&page_size=50")
+        matches = [item for item in listing["items"] if item["name"] == name]
+        if matches:
+            return matches[0]
+        time.sleep(0.3)
+    raise RuntimeError(f"未在管理 API 检索到工作流 {name!r}")
+
+
+def _resolve_decision(
+    port: int, task_uuid: str, decision: dict[str, Any], deadline: float
 ) -> dict[str, Any]:
-    """等待失败 attempt 进入错误决策链，选择「标记失败」放行并返回决策证据。"""
+    """等待失败 attempt 进入错误决策链，按网页的选择放行并返回决策证据。"""
 
     while time.monotonic() < deadline:
-        listing = _api_request(management_port, "/error-decisions")
-        pending = [
-            item
-            for item in listing["items"]
-            if item.get("task_id") == task_uuid
-        ]
+        listing = _api_request(port, "/error-decisions")
+        pending = [item for item in listing["items"] if item.get("task_id") == task_uuid]
         if pending:
             report = pending[0]
-            decision_id = report["decision_id"]
             resolved = _api_request(
-                management_port,
-                f"/error-decisions/{decision_id}",
+                port,
+                f"/error-decisions/{report['decision_id']}",
                 {
-                    "action": "abort",
-                    "reason": "exception-demo smoke 放行失败结果",
+                    **decision,
                     # 决策必须回带 job/device 完成三元校验
                     "job_id": report["job_id"],
                     "device_id": report["device_id"],
@@ -236,74 +260,44 @@ def _resolve_failure_decision(
             )
             assert resolved["status"] == "resolved", f"决策未被接受: {resolved}"
             return {
-                "decision_id": decision_id,
+                "decision_id": report["decision_id"],
                 "device_id": report.get("device_id", ""),
                 "action_name": report.get("action_name", ""),
                 "exception_type": report.get("exception_type", ""),
                 "error_message": report.get("error_message", ""),
-                "options": [
-                    str(option.get("action"))
-                    for option in report.get("options", [])
-                ],
-                "resolved_action": "abort",
+                "options": [str(option.get("action")) for option in report.get("options", [])],
+                "selected_action": decision["action"],
             }
         time.sleep(0.3)
     raise RuntimeError(f"任务 {task_uuid} 的错误决策未在时限内出现")
 
 
-def run_workflow_stage(management_port: int, timeout: float) -> dict[str, Any]:
-    """检索工作流 -> 创建任务 -> 决策链放行失败 -> 等待终态 -> 汇总节点结果。"""
+def run_workflow(
+    port: int, name: str, decision: dict[str, Any], deadline: float
+) -> dict[str, Any]:
+    """检索工作流 -> 创建任务 -> 决策链放行 -> 等待终态 -> 汇总节点结果。"""
 
-    deadline = time.monotonic() + timeout
-
-    workflow_uuid = ""
-    while time.monotonic() < deadline:
-        try:
-            listing = _api_request(
-                management_port, "/workflows?page=1&page_size=50"
-            )
-        except (urllib.error.URLError, OSError):
-            time.sleep(0.3)
-            continue
-        matches = [
-            item
-            for item in listing["items"]
-            if item["name"] == WORKFLOW_DISPLAY_NAME
-        ]
-        if matches:
-            workflow_uuid = matches[0]["uuid"]
-            break
-        time.sleep(0.3)
-    if not workflow_uuid:
-        raise RuntimeError(
-            f"{timeout}s 内未在管理 API 检索到工作流 {WORKFLOW_DISPLAY_NAME!r}"
-        )
-
+    workflow = _find_workflow(port, name, deadline)
     task = _api_request(
-        management_port,
-        "/workflow-tasks",
-        {"workflow_uuid": workflow_uuid, "run_mode": "normal"},
+        port, "/workflow-tasks", {"workflow_uuid": workflow["uuid"], "run_mode": "normal"}
     )
     task_uuid = task["uuid"]
-
-    # 第三步失败会先挂入错误决策链；选择 abort 放行 failed 结果
-    decision = _resolve_failure_decision(management_port, task_uuid, deadline)
+    resolved = _resolve_decision(port, task_uuid, decision, deadline)
 
     status = str(task.get("status") or "")
-    while time.monotonic() < deadline and status not in {"succeeded", "failed"}:
+    while time.monotonic() < deadline and status not in TERMINAL:
         time.sleep(0.3)
-        current = _api_request(management_port, f"/workflow-tasks/{task_uuid}")
-        status = str(current.get("status") or "")
-    if status not in {"succeeded", "failed"}:
-        raise RuntimeError(f"工作流任务 {task_uuid} 未在 {timeout}s 内结束: {status}")
+        status = str(_api_request(port, f"/workflow-tasks/{task_uuid}").get("status") or "")
+    if status not in TERMINAL:
+        raise RuntimeError(f"工作流任务 {task_uuid} 未在时限内结束: {status}")
 
-    jobs = _api_request(management_port, f"/workflow-tasks/{task_uuid}/jobs")
+    jobs = _api_request(port, f"/workflow-tasks/{task_uuid}/jobs")
     return {
-        "workflow_uuid": workflow_uuid,
-        "workflow_name": WORKFLOW_DISPLAY_NAME,
+        "workflow_uuid": workflow["uuid"],
+        "workflow_name": name,
         "task_uuid": task_uuid,
         "task_status": status,
-        "decision": decision,
+        "decision": resolved,
         # task 级 output 不进公开 HTTP 契约，节点结果一律取 job.return_info
         "jobs": [
             {
@@ -317,48 +311,23 @@ def run_workflow_stage(management_port: int, timeout: float) -> dict[str, Any]:
     }
 
 
-def run_smoke(
-    backend: str = "hostlink",
-    timeout: float = 30.0,
-) -> dict[str, Any]:
-    """启动真实图，等待异常闭环 proof，再运行预期失败的工作流。"""
+def run_smoke(backend: str = "hostlink", timeout: float = 30.0) -> dict[str, Any]:
+    """启动真实图，经管理 API 依次提交两条工作流并做决策，返回可机读证据。"""
 
     if backend not in {"hostlink", "ros2"}:
         raise ValueError("backend must be hostlink or ros2")
     repo_root = Path(__file__).resolve().parents[1]
-    with tempfile.TemporaryDirectory(
-        prefix=f"exception-demo-{backend}-"
-    ) as directory:
+    with tempfile.TemporaryDirectory(prefix=f"exception-demo-{backend}-") as directory:
         root = Path(directory)
-        proof_path = root / "proof.json"
         log_path = root / "runtime.log"
         environment = os.environ.copy()
-        environment.update(
-            {
-                "EXCEPTION_DEMO_PROOF_FILE": str(proof_path),
-                "EXCEPTION_DEMO_START_DELAY": (
-                    "2.0" if backend == "ros2" else "0.2"
-                ),
-                "PYTHONUNBUFFERED": "1",
-            }
-        )
-        hostlink_port = _free_port()
+        environment["PYTHONUNBUFFERED"] = "1"
         management_port = _free_port()
-        command = _base_command(
-            repo_root,
-            root / "db",
-            management_port,
-            backend,
-        )
+        command = _base_command(repo_root, root / "db", management_port, backend)
         if backend == "hostlink":
-            command += [
-                "--hostlink_bind",
-                "127.0.0.1",
-                "--hostlink_port",
-                str(hostlink_port),
-            ]
+            command += ["--hostlink_bind", "127.0.0.1", "--hostlink_port", str(_free_port())]
         else:
-            domain_id = str(10 + hostlink_port % 190)
+            domain_id = str(10 + management_port % 190)
             environment["ROS_DOMAIN_ID"] = domain_id
             command += ["--ros_domain_id", domain_id]
 
@@ -372,67 +341,49 @@ def run_smoke(
                 text=True,
             )
             try:
-                proof: dict[str, Any] | None = None
                 deadline = time.monotonic() + timeout
-                while time.monotonic() < deadline:
-                    if proof_path.is_file():
-                        proof = json.loads(
-                            proof_path.read_text(encoding="utf-8")
-                        )
-                        if proof.get("success") is not True:
-                            raise RuntimeError(
-                                f"{backend} smoke failed: {proof}\n"
-                                + log_path.read_text(
-                                    encoding="utf-8", errors="replace"
-                                )
-                            )
-                        assert_smoke_proof(proof, backend)
-                        break
-                    if process.poll() is not None:
-                        break
-                    time.sleep(0.1)
-                if proof is None:
-                    raise RuntimeError(
-                        f"{backend} smoke did not complete within {timeout}s\n"
-                        + log_path.read_text(
-                            encoding="utf-8", errors="replace"
-                        )
-                    )
-
-                # 阶段二：上报结果已在启动时完成，这里检索并真实运行工作流
-                try:
-                    proof["workflow"] = run_workflow_stage(
-                        management_port, timeout
-                    )
-                    assert_workflow_proof(proof["workflow"])
-                except Exception:
-                    sys.stderr.write(
-                        "WORKFLOW STAGE FAILED\n"
-                        + log_path.read_text(encoding="utf-8", errors="replace")
-                        + "\n"
-                    )
-                    raise
-                return proof
+                _wait_management_api(management_port, process, deadline)
+                failure = run_workflow(
+                    management_port,
+                    FAILURE_WORKFLOW_NAME,
+                    {"action": "abort", "reason": "exception-demo smoke 放行失败结果"},
+                    deadline,
+                )
+                assert_failure_workflow(failure)
+                recovery = run_workflow(
+                    management_port,
+                    RECOVERY_WORKFLOW_NAME,
+                    {
+                        "action": "operator_intervention",
+                        "reason": "exception-demo smoke 人工替换结果",
+                        "result": OPERATOR_RESULT,
+                    },
+                    deadline,
+                )
+                assert_recovery_workflow(recovery)
+                return {
+                    "success": True,
+                    "backend": backend,
+                    "failure_workflow": failure,
+                    "recovery_workflow": recovery,
+                }
+            except Exception:
+                sys.stderr.write(
+                    "SMOKE FAILED\n"
+                    + log_path.read_text(encoding="utf-8", errors="replace")
+                    + "\n"
+                )
+                raise
             finally:
                 _stop(process)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--backend",
-        choices=("hostlink", "ros2"),
-        default="hostlink",
-    )
+    parser.add_argument("--backend", choices=("hostlink", "ros2"), default="hostlink")
     parser.add_argument("--timeout", type=float, default=30.0)
     args = parser.parse_args(argv)
-    print(
-        json.dumps(
-            run_smoke(args.backend, args.timeout),
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
+    print(json.dumps(run_smoke(args.backend, args.timeout), ensure_ascii=False, indent=2))
     return 0
 
 

@@ -1,26 +1,19 @@
-"""异常监督器 — 演示跨设备调用侧如何捕获远端动作异常。
+"""异常监督器 — 把"点对点调用侧捕获远端异常"暴露成一个可编排的动作。
 
-三段闭环（全部经共用 DeviceNode.call_device_action，不直接触碰驱动实例）：
+演示以网页工作流提交为主路径：工作流节点调用本设备的 ``probe_remote_failure``，
+动作内部经共用 ``DeviceNode.call_device_action`` 调用 ``fault_injector.run_step(fail=True)``；
+远端抛出的 ``RuntimeError`` 直接传播回本设备，由 ``try/except`` 捕获后作为结构化
+返回值交还——因此这个 job 是 **成功** 的，异常只体现在返回值里。
 
-1. 调 fault_injector 的 run_step(fail=False)：正常拿到返回值；
-2. 调 run_step(fail=True)：远端抛 RuntimeError，动作失败——本设备 try/except
-   捕获调用异常并记录错误文本（跨设备异常捕获）；
-3. 调 run_guarded(fail=True)：远端驱动内部已捕获，动作成功返回结构化错误
-   （业务级兜底，调用方无需 try/except）；
-4. 调 stats()：验证故障后目标设备仍在服务。
-
-结果写入 EXCEPTION_DEMO_PROOF_FILE 指定的终态 JSON，供有限时 smoke 断言。
+与之对照：工作流直接调用 ``fault_injector.run_step(fail=True)`` 的节点会让异常穿出
+动作边界，job 失败并进入错误决策链（见 workflows.py）。
 """
 
-import json
 import logging
-import os
-from pathlib import Path
-import threading
 import time
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
-from unilabos.registry.decorators import device, not_action, topic_config
+from unilabos.registry.decorators import action, device, not_action, topic_config
 
 #: 目标设备节点 id（需与 graph 中故障注入器的 node id 一致）。
 FAULT_DEVICE_ID = "fault_injector"
@@ -30,11 +23,11 @@ FAULT_DEVICE_ID = "fault_injector"
     id="exception_supervisor_demo",
     display_name="异常监督器",
     category=["virtual_device"],
-    description="跨设备调用故障注入器，演示远端异常捕获与业务级兜底两条路径",
+    description="跨设备调用故障注入器并在调用侧捕获远端异常，作为工作流节点演示点对点异常传播",
     supported_backends=["hostlink", "ros2"],
 )
 class ExceptionSupervisorDemo:
-    """依次驱动成功/异常/受护三类远端动作并写出终态证明。"""
+    """在调用侧捕获远端动作异常的监督设备。"""
 
     run_in_test_mode = True
 
@@ -54,19 +47,12 @@ class ExceptionSupervisorDemo:
         self._fault_device = (fault_device or FAULT_DEVICE_ID).strip()
         self.logger = logging.getLogger(f"ExceptionSupervisor.{self.device_id}")
         self._start_time = time.time()
-        self._phase: str = "idle"
+        self._probes: int = 0
+        self._last_probe: str = ""
 
     @not_action
     def post_init(self, node: Any) -> None:
         self._device_node = node
-        proof_file = os.environ.get("EXCEPTION_DEMO_PROOF_FILE", "").strip()
-        if proof_file:
-            threading.Thread(
-                target=self._run_proof,
-                args=(Path(proof_file),),
-                name="exception-demo-proof",
-                daemon=True,
-            ).start()
 
     @property
     @topic_config(period=1.0)
@@ -76,9 +62,15 @@ class ExceptionSupervisorDemo:
 
     @property
     @topic_config()
-    def phase(self) -> str:
-        """当前演示阶段：idle / running / done / failed。"""
-        return self._phase
+    def probe_count(self) -> int:
+        """已执行的远端探测次数。"""
+        return self._probes
+
+    @property
+    @topic_config()
+    def last_probe(self) -> str:
+        """最近一次探测的结果摘要。"""
+        return self._last_probe
 
     @not_action
     def _call(self, action_name: str, arguments: dict) -> Any:
@@ -90,62 +82,41 @@ class ExceptionSupervisorDemo:
             timeout=10.0,
         )
 
-    @not_action
-    def _run_proof(self, proof_file: Path) -> None:
-        """在真实运行时中按序执行三类调用，并原子写出可机读终态。"""
+    @action(
+        display_name="探测远端异常",
+        description="点对点调用 fault_injector.run_step(fail=True)，远端异常由本设备捕获并作为返回值交还（本 job 成功）",
+        always_free=True,
+        feedback_interval=1.0,
+    )
+    def probe_remote_failure(
+        self, step_name: str = "explode", message: str = "injected-failure"
+    ) -> Dict[str, Any]:
+        """跨设备调用一个注定失败的远端动作，并在调用侧捕获异常。
 
-        delay = float(os.environ.get("EXCEPTION_DEMO_START_DELAY", "1.0"))
-        time.sleep(max(0.0, delay))
-        self._phase = "running"
+        Args:
+            step_name[步骤名]: 传给远端 run_step 的步骤标识。
+            message[错误文本]: 远端注入故障时的错误消息，用于核对异常文本保真。
+        """
+        self._probes += 1
         try:
-            # 1) 正常成功
-            ok_step = self._call("run_step", {"step_name": "warmup", "fail": False})
-
-            # 2) 远端抛异常 -> 动作失败 -> 调用方捕获（本演示的核心）
-            caught: dict[str, Any] = {"caught": False, "error_type": "", "error_text": ""}
-            try:
-                self._call(
-                    "run_step",
-                    {"step_name": "explode", "fail": True, "message": "injected-failure"},
-                )
-            except Exception as exc:  # noqa: BLE001 - 捕获任意远端错误形态
-                caught = {
-                    "caught": True,
-                    "error_type": type(exc).__name__,
-                    "error_text": str(exc),
-                }
-                self.logger.info(f"[Supervisor] 已捕获远端动作异常: {exc}")
-
-            # 3) 业务级兜底：远端已捕获，动作成功返回结构化错误
-            guarded = self._call(
-                "run_guarded", {"fail": True, "message": "guarded-failure"}
+            self._call(
+                "run_step", {"step_name": step_name, "fail": True, "message": message}
             )
-
-            # 4) 故障后目标设备仍在服务
-            stats = self._call("stats", {})
-
-            proof = {
+        except Exception as exc:  # noqa: BLE001 - 捕获任意远端错误形态
+            self._last_probe = f"{type(exc).__name__}: {exc}"
+            self.logger.info(f"[Supervisor] 已捕获远端动作异常: {exc}")
+            return {
                 "success": True,
-                "backend": str(getattr(self._device_node, "backend_name", "unknown")),
-                "fault_device": self._fault_device,
-                "ok_step": ok_step,
-                "caught": caught,
-                "guarded": guarded,
-                "stats": stats,
+                "caught": True,
+                "target_device": self._fault_device,
+                "error_type": type(exc).__name__,
+                "error_text": str(exc),
             }
-            self._phase = "done"
-        except Exception as exc:  # noqa: BLE001 - 演示用，报告任何失败
-            self.logger.exception("异常演示闭环失败")
-            proof = {
-                "success": False,
-                "backend": str(getattr(self._device_node, "backend_name", "unknown")),
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-            self._phase = "failed"
-        proof_file.parent.mkdir(parents=True, exist_ok=True)
-        temporary = proof_file.with_suffix(proof_file.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(proof, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temporary.replace(proof_file)
+        self._last_probe = "远端未抛出异常"
+        return {
+            "success": False,
+            "caught": False,
+            "target_device": self._fault_device,
+            "error_type": "",
+            "error_text": "",
+        }

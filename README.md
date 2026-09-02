@@ -2,23 +2,29 @@
 
 **English** | [中文](README_zh.md)
 
-This external device package demonstrates the two exception propagation paths
-in Uni-Lab-OS and where each one is caught:
+This external device package demonstrates how exceptions propagate in
+Uni-Lab-OS **through the web workflow submission path**: a workflow is
+created the way the web UI does it (`POST /api/v1/workflow-tasks`), a failed
+attempt shows up in the error-decision chain (`GET /api/v1/error-decisions`),
+and the operator's decision (`POST /api/v1/error-decisions/{id}`) determines
+the outcome. Nothing runs by itself inside the devices; every path is a
+workflow node:
 
-- **Point-to-point calls** (`DeviceNode.call_device_action`): an exception
-  raised by the remote action propagates straight back to the caller, who
-  catches it with `try/except` — `supervisor` catches the `RuntimeError`
-  injected by `fault_injector.run_step` and records the exception type and
-  error text;
-- **Scheduled jobs** (workflow nodes): a failed attempt does not immediately
-  terminate the task. It is held in the Backend error-decision chain
-  (retry / mark failed / operator replacement) and the task only reaches the
-  `failed` terminal state after the decision releases it;
-- **Business-level guard**: the driver catches internally and returns a
-  structured error (`run_guarded`); both the action and the job count as
-  succeeded, the error lives in the return value only;
-- **Availability after faults**: injected exceptions do not break the device;
-  the `stats` action keeps serving and reports honest counters.
+- **Exception escapes the action boundary** (`fault_injector.run_step(fail=True)`):
+  the job fails and is held in the error-decision chain until a decision
+  (`retry` / `abort` / `operator_intervention`) releases it — "task failed" is
+  an explicit decision outcome, not an implicit timeout;
+- **Point-to-point call, caught by the caller** (`supervisor.probe_remote_failure`):
+  the supervisor device calls `fault_injector.run_step(fail=True)` through
+  `DeviceNode.call_device_action`; the remote `RuntimeError` propagates straight
+  back and is caught by its `try/except`, so the job *succeeds* and the
+  exception lives in the return value;
+- **Business-level guard** (`fault_injector.run_guarded`): the driver catches
+  internally and returns a structured error; the job succeeds;
+- **Operator replacement**: choosing `operator_intervention` with a replacement
+  result marks the failed attempt as succeeded (`suc_type=operator_intervention`)
+  and the task continues;
+- **Availability after faults**: `stats` keeps serving and reports honest counters.
 
 ## Install from GitHub
 
@@ -39,27 +45,27 @@ No AK/SK and no cloud lab required.
 ## Terminating dual-runtime smoke
 
 ```bash
-python -m exception_demo.smoke --backend hostlink --timeout 30
+python -m exception_demo.smoke --backend hostlink --timeout 40
 python -m exception_demo.smoke --backend ros2 --timeout 60
 ```
 
-Stage one (closed-loop proof): `supervisor` remotely invokes the four
-`fault_injector` actions and writes `proof.json` — `warmup` succeeds,
-`explode` raises and the caller catches it (the error text faithfully carries
-`injected-failure`), `run_guarded` returns a structured error, and `stats`
-proves the device is still serving (3 attempts, 2 failures).
+The smoke boots the real runtime (`unilab -g graph/exception_demo.json`, which
+also reports the `@workflow` templates to the local Workflow Authority) and then
+replays exactly what the web UI does through the management HTTP API:
 
-Stage two (workflow): the smoke runs the "异常传播演示" workflow through the
-management HTTP API. After the third step injects a failure:
-
-- `GET /api/v1/error-decisions` exposes the pending decision report
-  (exception type, error text, options `retry` / `abort` /
-  `operator_intervention`);
-- `POST /api/v1/error-decisions/{decision_id}` selects `abort` to release the
-  failed result;
-- the task ends `failed`, the first two node jobs are `succeeded` (the guarded
-  step's error lives in `return_info.return_value`), and the third job is
-  `failed` with a populated `error_info`.
+1. **"异常传播演示"** (expected terminal state `failed`, 4 jobs):
+   `run_step(warmup)` succeeds → `supervisor.probe_remote_failure` catches the
+   remote `RuntimeError` on the caller side (job `succeeded`, `caught: true`
+   with the faithful `injected-failure` text) → `run_guarded(fail=True)`
+   returns a structured error (job `succeeded`) → `run_step(final, fail=True)`
+   escapes; the pending decision report (exception type, error text, options
+   `retry` / `abort` / `operator_intervention`) is resolved with `abort`; the
+   job ends `failed` with `error_info` and the task ends `failed`.
+2. **"人工替换恢复演示"** (expected terminal state `succeeded`, 2 jobs):
+   `run_step(flaky, fail=True)` fails → the decision is resolved with
+   `operator_intervention` carrying a replacement `result` → the job is released
+   as `succeeded` with `suc_type=operator_intervention` and the replacement
+   value → `stats` runs and reports `attempts=5, failures=4`.
 
 ## Manual start
 
@@ -75,23 +81,20 @@ python -m unilabos --backend ros2 --disable_hostlink --skip_env_check \
   -g ./graph/exception_demo.json
 ```
 
-## Default sub-workflow and the error-decision chain
+Then open the management UI (or call the API above): run "异常传播演示", watch
+the decision appear under error decisions, and pick a decision.
 
-`exception_demo/workflows.py` declares the "异常传播演示" workflow with the
-core repo's `@workflow` decorator — three serial steps on the same device:
+## Default sub-workflows and the error-decision chain
 
-1. `run_step(fail=False)` — success baseline;
-2. `run_guarded(fail=True)` — the exception is caught inside the driver, the
-   job succeeds, the error lives in the return value;
-3. `run_step(fail=True)` — the exception escapes the action boundary and the
-   job fails.
-
-At host startup the AST scan discovers the module and idempotently upserts it
-into the local Workflow Authority under a stable uuid derived from the
-function's relative path. Failures of actions without an `error_policy` enter
-the unified Backend decision chain and wait for an `abort` / `retry` /
-`operator_intervention` decision — so in this system "task failed" is an
-explicit decision outcome, not an implicit timeout.
+`exception_demo/workflows.py` declares both workflows with the core repo's
+`@workflow` decorator. At host startup the AST scan discovers the module and
+idempotently upserts them into the local Workflow Authority under stable uuids
+derived from the functions' relative paths. `run_template("exception_supervisor_demo/…")`
+resolves the single supervisor instance by class; `run("fault_injector/…")`
+addresses the fault injector by instance id. Failures of actions without an
+`error_policy` enter the unified decision chain; `retry` creates a new attempt
+on the Backend side (the local scheduler releases the failed attempt), `abort`
+releases the failure, `operator_intervention` replaces the result.
 
 ## Layout
 
@@ -99,8 +102,8 @@ explicit decision outcome, not an implicit timeout.
 graph/exception_demo.json          one graph shared by both backends
 exception_demo/
   fault_injector.py                fault-injecting target device (run_step/run_guarded/stats)
-  supervisor.py                    cross-device caller that catches exceptions
-  workflows.py                     @workflow default sub-workflow (expected to fail)
-  smoke.py                         terminating real-runtime proof
+  supervisor.py                    probe_remote_failure: point-to-point call that catches the remote exception
+  workflows.py                     @workflow "异常传播演示" (failed) and "人工替换恢复演示" (succeeded)
+  smoke.py                         terminating real-runtime proof driven through the management API
 tests/test_hostlink_smoke.py       HostLink integration assertions
 ```
