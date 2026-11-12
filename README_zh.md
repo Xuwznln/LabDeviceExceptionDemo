@@ -4,8 +4,10 @@
 
 这个外部设备包演示 Uni-Lab-OS 中异常**沿网页工作流提交路径**的传播方式：像网页一样创建
 任务（`POST /api/v1/workflow-tasks`），失败的 attempt 出现在错误决策链
-（`GET /api/v1/error-decisions`），由操作者的决策（`POST /api/v1/error-decisions/{id}`）
-决定结果。设备内部不自跑任何闭环，每一条路径都是一个工作流节点：
+（`GET /api/v1/error-decisions`，待决策项在 `decisions` 下），由操作者的决策
+（`POST /api/v1/error-decisions/{id}`，成功返回 `status: "delivered"`）决定结果。这些路由遵循
+V1.0 合同：响应一律是 `{"code", "data"}` 信封，写请求带 `X-UniLab-Token` 请求头。设备内部不自跑
+任何闭环，每一条路径都是一个工作流节点：
 
 - **异常穿出动作边界**（`fault_injector.run_step(fail=True)`）：job 失败并挂入错误决策链，
   等待 `retry` / `abort` / `operator_intervention` 放行——「任务失败」是显式决策结果，
@@ -24,8 +26,21 @@
 
 ## 从 GitHub 安装
 
+需要统一版 Uni-Lab-OS 核心（dev 架构 + V1.0 HTTP API），仅支持 **CPython 3.14**；配套 wheel
+（PyLabRobot 维护分支 `1.0.0b1+unilabos…` 与 `opentrons-shared-data 10.1.0+unilabos.np2.1`）
+用核心的 `scripts/build_wheel_release.py --dependencies-only` 构建，安装时经 `--find-links` 提供。
+ROS 2 运行使用为 cp314 构建的 RoboStack Jazzy（`ros2-distro-mutex` 0.20）。
+
+Host 运行时（`unilab --backend hostlink`）经管理 API 安装，来源是 GitHub 地址，可附 `@<commit-sha>`：
+
 ```bash
-unilab package install https://github.com/Xuwznln/LabDeviceExceptionDemo --ref <commit-sha>
+unilab package install https://github.com/Xuwznln/LabDeviceExceptionDemo@<commit-sha> --wait
+```
+
+也可以直接装进当前 Python 环境（CI 即如此）：
+
+```bash
+python -m pip install "git+https://github.com/Xuwznln/LabDeviceExceptionDemo@<commit-sha>"
 ```
 
 本地开发可使用：
