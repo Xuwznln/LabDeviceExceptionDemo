@@ -243,6 +243,21 @@ def _base_command(
     return command
 
 
+#: 统一 Core 的业务码：Host 子进程尚未接入控制面（启动 / 安静点重启）时，Host 专有路由
+#: （如 ``/runtime/endpoints``）返回 HTTP 200 + ``{"code": 5001}``，就绪等待应继续轮询。
+SERVICE_UNAVAILABLE = 5001
+
+
+class ManagementAPIError(RuntimeError):
+    """管理 API 返回了非 0 业务码（V1 信封 ``{"code", "error": {"msg"}}``）。"""
+
+    def __init__(self, path: str, body: dict[str, Any]) -> None:
+        super().__init__(f"管理 API {path} 返回错误: {body}")
+        self.path = path
+        self.code = body.get("code")
+        self.body = body
+
+
 def _api_request(
     port: int, path: str, payload: dict[str, Any] | None = None
 ) -> Any:
@@ -263,7 +278,7 @@ def _api_request(
         body = json.loads(response.read().decode("utf-8"))
     if isinstance(body, dict) and "code" in body:
         if body["code"] != 0:
-            raise RuntimeError(f"管理 API {path} 返回错误: {body}")
+            raise ManagementAPIError(path, body)
         return body.get("data")
     return body
 
@@ -288,6 +303,10 @@ def _wait_management_api(port: int, process: subprocess.Popen[Any], deadline: fl
                 and {"run_flaky","run_guarded","probe_remote_failure"} <= actions
             ):
                 return
+        except ManagementAPIError as error:
+            # 默认拓扑里 Host 是调度权威的子进程，接入控制面前 Host 专有路由返回 5001
+            if error.code != SERVICE_UNAVAILABLE:
+                raise
         except (urllib.error.URLError, OSError):
             pass
         time.sleep(0.3)
@@ -316,7 +335,8 @@ def _resolve_decision(
 
     while time.monotonic() < deadline:
         listing = _api_request(port, "/error-decisions")
-        pending = [item for item in listing["items"] if item.get("task_id") == task_uuid]
+        # V1 合同：待决策清单在 ``decisions`` 下
+        pending = [item for item in listing["decisions"] if item.get("task_id") == task_uuid]
         if pending:
             report = pending[0]
             resolved = _api_request(
@@ -329,7 +349,8 @@ def _resolve_decision(
                     "device_id": report["device_id"],
                 },
             )
-            assert resolved["status"] == "resolved", f"决策未被接受: {resolved}"
+            # V1 合同：决策已投递给执行面即 ``delivered``
+            assert resolved["status"] == "delivered", f"决策未被接受: {resolved}"
             return {
                 "decision_id": report["decision_id"],
                 "device_id": report.get("device_id", ""),

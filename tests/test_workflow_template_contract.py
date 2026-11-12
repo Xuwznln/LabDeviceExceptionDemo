@@ -68,3 +68,64 @@ def test_smoke_rejects_ambiguous_template_name(monkeypatch):
     monkeypatch.setattr(smoke, "_api_request", api)
     with pytest.raises(AssertionError, match="重复"):
         smoke._find_workflow(8002, name, time.monotonic() + 2)
+
+
+def test_readiness_retries_while_host_attaches(monkeypatch):
+    """统一 Core 默认拓扑：Host 子进程接入控制面前，Host 专有路由返回业务码 5001，继续轮询。"""
+
+    endpoint = "/runtime/endpoints?state=online&limit=100"
+    calls = []
+
+    def api(port, path):
+        calls.append(path)
+        if path == "/health":
+            return {"status": "ok", "execution": "ready"}
+        assert path == endpoint
+        if calls.count(endpoint) == 1:
+            raise smoke.ManagementAPIError(path, {"code": 5001, "error": {"msg": "Host 执行进程暂不可用"}})
+        return [{"action_capabilities": [{"action_name": name} for name in ["run_flaky","run_guarded","probe_remote_failure"]]}]
+
+    monkeypatch.setattr(smoke, "_api_request", api)
+    monkeypatch.setattr(smoke.time, "sleep", lambda _: None)
+    smoke._wait_management_api(8002, SimpleNamespace(poll=lambda: None), time.monotonic() + 2)
+    assert calls.count(endpoint) == 2
+
+
+def test_readiness_surfaces_other_api_errors(monkeypatch):
+    def api(port, path):
+        if path == "/health":
+            return {"status": "ok", "execution": "ready"}
+        raise smoke.ManagementAPIError(path, {"code": 1002, "error": {"msg": "unauthorized"}})
+
+    monkeypatch.setattr(smoke, "_api_request", api)
+    monkeypatch.setattr(smoke.time, "sleep", lambda _: None)
+    with pytest.raises(smoke.ManagementAPIError, match="1002"):
+        smoke._wait_management_api(8002, SimpleNamespace(poll=lambda: None), time.monotonic() + 2)
+
+
+def test_decision_follows_v1_error_decisions_contract(monkeypatch):
+    """V1：清单在 ``decisions`` 下，放行成功返回 ``status: delivered``；job/device 回带校验。"""
+
+    report = {
+        "decision_id": "decision",
+        "task_id": "task",
+        "job_id": "job",
+        "device_id": "fault_injector",
+        "action_name": "fault_injector/run_step",
+        "exception_type": "RuntimeError",
+        "error_message": "injected-failure",
+        "options": [{"action": "retry"}, {"action": "abort"}],
+    }
+    posted = []
+
+    def api(port, path, payload=None):
+        if path == "/error-decisions":
+            return {"decisions": [{**report, "task_id": "other"}, report]}
+        assert path == "/error-decisions/decision"
+        posted.append(payload)
+        return {"decision_id": "decision", "status": "delivered"}
+
+    monkeypatch.setattr(smoke, "_api_request", api)
+    resolved = smoke._resolve_decision(8002, "task", {"action": "abort", "reason": "e2e"}, time.monotonic() + 2)
+    assert posted == [{"action": "abort", "reason": "e2e", "job_id": "job", "device_id": "fault_injector"}]
+    assert resolved["selected_action"] == "abort" and resolved["options"] == ["retry", "abort"]

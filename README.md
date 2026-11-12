@@ -5,10 +5,12 @@
 This external device package demonstrates how exceptions propagate in
 Uni-Lab-OS **through the web workflow submission path**: a workflow is
 created the way the web UI does it (`POST /api/v1/workflow-tasks`), a failed
-attempt shows up in the error-decision chain (`GET /api/v1/error-decisions`),
-and the operator's decision (`POST /api/v1/error-decisions/{id}`) determines
-the outcome. Nothing runs by itself inside the devices; every path is a
-workflow node:
+attempt shows up in the error-decision chain (`GET /api/v1/error-decisions`,
+pending reports under `decisions`), and the operator's decision
+(`POST /api/v1/error-decisions/{id}`, answered with `status: "delivered"`)
+determines the outcome. These routes follow the V1.0 contract: every response is
+the envelope `{"code", "data"}` and writes carry the `X-UniLab-Token` header. Nothing
+runs by itself inside the devices; every path is a workflow node:
 
 - **Exception escapes the action boundary** (`fault_injector.run_step(fail=True)`):
   the job fails and is held in the error-decision chain until a decision
@@ -32,8 +34,23 @@ workflow node:
 
 ## Install from GitHub
 
+Requires the unified Uni-Lab-OS core (dev architecture with the V1.0 HTTP API) on
+**CPython 3.14**, plus its companion wheels: the maintained PyLabRobot fork
+`1.0.0b1+unilabos…` and `opentrons-shared-data 10.1.0+unilabos.np2.1`. Build them with the
+core's `scripts/build_wheel_release.py --dependencies-only` and install with `--find-links`.
+ROS 2 runs use RoboStack Jazzy built for cp314 (`ros2-distro-mutex` 0.20).
+
+With a Host running (`unilab --backend hostlink`), install through its management API. The
+spec is the GitHub URL with an optional `@<commit-sha>`:
+
 ```bash
-unilab package install https://github.com/Xuwznln/LabDeviceExceptionDemo --ref <commit-sha>
+unilab package install https://github.com/Xuwznln/LabDeviceExceptionDemo@<commit-sha> --wait
+```
+
+Or install the distribution into the current Python environment (this is what CI does):
+
+```bash
+python -m pip install "git+https://github.com/Xuwznln/LabDeviceExceptionDemo@<commit-sha>"
 ```
 
 For local development:
