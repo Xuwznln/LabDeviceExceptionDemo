@@ -9,7 +9,7 @@ attempt shows up in the error-decision chain (`GET /api/v1/error-decisions`,
 pending reports under `decisions`), and the operator's decision
 (`POST /api/v1/error-decisions/{id}`, answered with `status: "delivered"`)
 determines the outcome. These routes follow the V1.0 contract: every response is
-the envelope `{"code", "data"}` and writes carry the `X-UniLab-Token` header. Nothing
+the envelope `{"code", "data"}`. Nothing
 runs by itself inside the devices; every path is a workflow node:
 
 - **Exception escapes the action boundary** (`fault_injector.run_step(fail=True)`):

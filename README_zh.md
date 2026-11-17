@@ -6,7 +6,7 @@
 任务（`POST /api/v1/workflow-tasks`），失败的 attempt 出现在错误决策链
 （`GET /api/v1/error-decisions`，待决策项在 `decisions` 下），由操作者的决策
 （`POST /api/v1/error-decisions/{id}`，成功返回 `status: "delivered"`）决定结果。这些路由遵循
-V1.0 合同：响应一律是 `{"code", "data"}` 信封，写请求带 `X-UniLab-Token` 请求头。设备内部不自跑
+V1.0 合同：响应一律是 `{"code", "data"}` 信封。设备内部不自跑
 任何闭环，每一条路径都是一个工作流节点：
 
 - **异常穿出动作边界**（`fault_injector.run_step(fail=True)`）：job 失败并挂入错误决策链，
