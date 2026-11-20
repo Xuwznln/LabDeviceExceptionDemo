@@ -114,12 +114,13 @@ python -m unilabos --backend ros2 --disable_hostlink --skip_env_check \
   -g ./graph/exception_demo.json
 ```
 
-Then open the management UI (or call the API above): run "异常传播演示", watch
+Then open a frontend connected to this backend (`unilab` serves no UI itself; the page at
+`http://127.0.0.1:8002/` links OpenLab), or call the API above: run "异常传播演示", watch
 the decision appear under error decisions, and pick a decision.
 
 ## Default sub-workflows and the error-decision chain
 
-`exception_demo/workflows.py` declares both workflows with the core repo's
+`exception_demo/workflows.py` declares the three workflows with the core repo's
 `@workflow` decorator. At host startup the AST scan discovers the module and
 idempotently upserts them into the local Workflow Authority under stable uuids
 derived from the functions' relative paths. `run_template("exception_supervisor_demo/…")`

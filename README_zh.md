@@ -97,12 +97,13 @@ python -m unilabos --backend ros2 --disable_hostlink --skip_env_check \
   -g ./graph/exception_demo.json
 ```
 
-然后打开管理页面（或直接调上面的 API）：运行「异常传播演示」，在错误决策里看到待决策项，
+然后打开连接本后端的前端（`unilab` 本身不提供页面，`http://127.0.0.1:8002/` 上有 OpenLab 入口），
+或直接调上面的 API：运行「异常传播演示」，在错误决策里看到待决策项，
 选择一个决策。
 
 ## 默认子工作流与错误决策链
 
-`exception_demo/workflows.py` 用主仓的 `@workflow` 装饰器声明了两条工作流。host 启动时
+`exception_demo/workflows.py` 用主仓的 `@workflow` 装饰器声明了三条工作流。host 启动时
 AST 扫描发现该模块，按函数相对路径派生稳定 uuid 幂等上报到本机 Workflow Authority。
 `run_template("exception_supervisor_demo/…")` 按类名解析唯一的监督器实例；
 `run("fault_injector/…")` 按实例 id 指定故障注入器。未配置 `error_policy` 的动作失败进入
